@@ -1,0 +1,346 @@
+name: Lock cancellation validation
+
+on:
+  push:
+    branches: [fix/lock-admission-cancellation-1.0.4]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lock-cancellation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    if: github.repository == 'ixbtcom/rustfs'
+    runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '16'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      RUST_BACKTRACE: '1'
+      NO_PROXY: 'localhost,127.0.0.1,::1'
+    steps:
+      - &self_hosted_gate
+        id: runner_gate
+        name: Gate the dedicated self-hosted builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -un)" = github-runner
+          test "$(id -u)" -ne 0
+          test "$RUNNER_NAME" = ci-runner-2
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          sudo -n true
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          gib = 1024 ** 3
+          memory = int(next(line.split()[1] for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))) * 1024
+          cgroup_root = pathlib.Path('/sys/fs/cgroup')
+          cgroups = {cgroup_root}
+          for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines():
+              if line.startswith('0::'):
+                  relative = pathlib.PurePosixPath(line.split('::', 1)[1].lstrip('/'))
+                  if '..' not in relative.parts:
+                      current = cgroup_root / relative
+                      while current.is_relative_to(cgroup_root):
+                          cgroups.add(current)
+                          if current == cgroup_root:
+                              break
+                          current = current.parent
+          cpu = len(os.sched_getaffinity(0))
+          for directory in cgroups:
+              limit = directory / 'memory.max'
+              if limit.is_file() and (value := limit.read_text().strip()) != 'max':
+                  memory = min(memory, int(value))
+              quota = directory / 'cpu.max'
+              if quota.is_file():
+                  maximum, period = quota.read_text().split()
+                  if maximum != 'max':
+                      cpu = min(cpu, int(maximum) // int(period))
+          disk = shutil.disk_usage('.').free
+          print(f'effective_memory_bytes={memory}, effective_cpus={cpu}, free_disk_bytes={disk}')
+          if memory < 60 * gib or cpu < 16 or disk < 40 * gib:
+              raise SystemExit('builder requires at least 60 GiB effective RAM, 16 CPUs and 40 GiB free disk')
+          PY
+          tool_cache="${RUNNER_TOOL_CACHE:?runner tool cache is required}"
+          mkdir -p "$tool_cache"
+          test -w "$tool_cache"
+          printf 'Runner tool cache: %s\n' "$tool_cache"
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+            ca-certificates curl git python3 unzip zip cmake liblzma-dev \
+            binutils file jq time build-essential pkg-config libssl-dev ripgrep
+      - id: checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Record source and available resources
+        run: |
+          git rev-parse HEAD
+          sha256sum Cargo.lock
+          df -h .
+          free -h
+      - uses: ./.github/actions/setup
+        with:
+          rust-version: '1.99.0'
+          install-cross-tools: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+          cache-shared-key: lock-cancellation-1.0.4-1.99
+          cache-save-if: 'true'
+      - name: Native formatter and toolchain identity
+        run: |
+          rustup component add rustfmt --toolchain 1.99.0
+          rustc --version --verbose
+          cargo --version
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Reproduce the unfixed native transport regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=crates/ecstore/src/cluster/rpc/remote_locker.rs
+          trap 'git show "HEAD:$source_file" > "$source_file"' EXIT
+          git show '2d2c229c0bfc77dd966f675c26f1e7168616c027:crates/ecstore/src/cluster/rpc/remote_locker.rs' > "$source_file"
+          cargo test --locked -p rustfs-ecstore --lib --no-run
+          set +e
+          cargo test --locked -p rustfs-ecstore --lib cluster::rpc::remote_locker::tests::transport_cancellation::cancelled_lock_over_tonic_releases_admission_and_late_remote_lock_once -- --exact --test-threads=1 2>&1 | tee baseline-test.log
+          test_rc=${PIPESTATUS[0]}
+          set -e
+          test "$test_rc" -eq 101
+          grep -F 'late tonic response must free admission and issue native UnLockBatch' baseline-test.log
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' baseline-test.log
+      - name: Native remote locker tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p rustfs-ecstore --lib cluster::rpc::remote_locker::tests:: -- --test-threads=1 2>&1 | tee lock-tests.log
+      - name: Check production binary with locked dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --locked -p rustfs --bin rustfs --features pyroscope 2>&1 | tee binary-check.log
+          git diff --exit-code -- Cargo.lock
+      - name: Record native validation resource snapshot
+        if: always() && steps.checkout.outcome == 'success'
+        run: |
+          {
+            date -u --iso-8601=seconds
+            free -m
+            df -h .
+            grep -H . /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak \
+              /sys/fs/cgroup/memory.events /sys/fs/cgroup/cpu.stat \
+              /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null || true
+          } | tee resource-snapshot.txt
+      - name: Preserve validation logs
+        if: always() && steps.checkout.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: lock-validation-${{ github.sha }}
+          path: |
+            baseline-test.log
+            lock-tests.log
+            binary-check.log
+            resource-snapshot.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release-linux:
+    if: github.repository == 'ixbtcom/rustfs'
+    needs: native-linux
+    runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '16'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      BUILD_TARGET: x86_64-unknown-linux-gnu
+      BUILD_OS: linux-x86_64
+      NO_PROXY: 'localhost,127.0.0.1,::1'
+    steps:
+      - *self_hosted_gate
+      - id: checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Gate exact release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 46337942d55f3a8e6a97b147ca98d9ea8115555d HEAD
+          git diff --exit-code 46337942d55f3a8e6a97b147ca98d9ea8115555d -- Cargo.toml Cargo.lock
+          printf 'RUSTFS_BUILD_VERSION=1.0.4+ixbt.%s\n' "$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          mkdir -p dist
+      - uses: ./.github/actions/setup
+        with:
+          rust-version: '1.99.0'
+          target: x86_64-unknown-linux-gnu
+          install-cross-tools: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+          cache-shared-key: lock-cancellation-release-1.0.4-1.99
+          cache-save-if: 'true'
+      - name: Prepare pinned embedded console
+        shell: bash
+        run: |
+          set -euo pipefail
+          console_zip="$RUNNER_TEMP/rustfs-console-v0.1.37.zip"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-delay 5 --max-time 300 \
+            https://github.com/rustfs/console/releases/download/v0.1.37/rustfs-console-v0.1.37.zip \
+            --output "$console_zip"
+          printf 'e6ff2c7e7695de824ec4cda91d8611d1aba5d8462e6809592c92a50b23f5b9ab  %s\n' "$console_zip" | sha256sum --check --strict
+          mkdir -p rustfs/static
+          chmod +w rustfs/static/LICENSE || true
+          unzip -oq "$console_zip" -d rustfs/static
+          test -s rustfs/static/index.html
+      - name: Build release binary with production features
+        shell: bash
+        run: |
+          set -euo pipefail
+          # time reports a process/child maximum, not the whole CT's memory peak.
+          /usr/bin/time -v cargo build --release --locked --target "$BUILD_TARGET" -p rustfs --bin rustfs \
+            --features pyroscope --config 'profile.release.strip="none"' 2>&1 | tee dist/release-build.log
+          git diff --exit-code -- Cargo.lock
+      - name: Verify release executable and deployment ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$BUILD_TARGET/release/rustfs"
+          file "$binary" | tee dist/file.txt
+          readelf --file-header "$binary" | tee dist/elf-header.txt
+          grep -Eq 'Class:[[:space:]]+ELF64' dist/elf-header.txt
+          grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' dist/elf-header.txt
+          ldd "$binary" | tee dist/ldd.txt
+          if grep -Fq 'not found' dist/ldd.txt; then
+            echo 'release binary has an unresolved shared library' >&2
+            exit 1
+          fi
+          python3 scripts/release/check_glibc.py 2.41 "$binary" | tee dist/glibc.txt
+          timeout 30s "$binary" --version | tee dist/version.txt
+          grep -Fq "$RUSTFS_BUILD_VERSION" dist/version.txt
+          grep -Fxq "build target : $BUILD_TARGET" dist/version.txt
+          grep -Fxq "build os     : $BUILD_OS" dist/version.txt
+          grep -Fxq "rust channel : stable-$BUILD_TARGET" dist/version.txt
+          timeout 30s "$binary" --help > dist/help.txt
+          test -s dist/help.txt
+      - name: Generate production CPU symbol sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 --filter-platform "$BUILD_TARGET" \
+            --features rustfs/pyroscope > "$RUNNER_TEMP/cpu-catalog-metadata.json"
+          features=$(jq -ce '
+            (.packages[] | select(.name == "rustfs") | .id) as $id |
+            .resolve.nodes[] | select(.id == $id) | .features | map(select(. != "default")) | sort
+          ' "$RUNNER_TEMP/cpu-catalog-metadata.json")
+          release_dir="target/$BUILD_TARGET/release"
+          rm -f "$release_dir/rustfs.cpu-symbol-catalog.json" "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+          cargo run --locked -p rustfs-connect-symbol-catalog -- \
+            "$release_dir/rustfs" "$(git rev-parse HEAD)" "$BUILD_TARGET" "$features" \
+            "$release_dir/rustfs.cpu-symbol-catalog.json" > "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+      - name: Record release resource snapshot
+        if: always() && steps.checkout.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p dist
+          {
+            date -u --iso-8601=seconds
+            free -m
+            df -h .
+            grep -H . /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak \
+              /sys/fs/cgroup/memory.events /sys/fs/cgroup/cpu.stat \
+              /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null || true
+          } | tee dist/resource-snapshot.txt
+      - name: Package and verify installable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="target/$BUILD_TARGET/release"
+          package="rustfs-linux-x86_64-gnu-v$RUSTFS_BUILD_VERSION.zip"
+          for member in rustfs rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256; do
+            test -s "$release_dir/$member"
+          done
+          zip -j "dist/$package" "$release_dir/rustfs" \
+            "$release_dir/rustfs.cpu-symbol-catalog.json" "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+          expected_members=$'rustfs\nrustfs.cpu-symbol-catalog.json\nrustfs.cpu-symbol-catalog.sha256'
+          test "$(unzip -Z1 "dist/$package" | sort)" = "$expected_members"
+          smoke_dir=$(mktemp -d "$RUNNER_TEMP/ixbt-release-smoke.XXXXXX")
+          unzip -q "dist/$package" -d "$smoke_dir"
+          cmp "$release_dir/rustfs" "$smoke_dir/rustfs"
+          timeout 30s "$smoke_dir/rustfs" --version > "$smoke_dir/version.txt"
+          cmp dist/version.txt "$smoke_dir/version.txt"
+          timeout 30s "$smoke_dir/rustfs" --help > "$smoke_dir/help.txt"
+          cmp dist/help.txt "$smoke_dir/help.txt"
+          git diff --exit-code -- Cargo.lock
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path('.')
+          dist = root / 'dist'
+          target = os.environ['BUILD_TARGET']
+          binary = root / 'target' / target / 'release' / 'rustfs'
+          version = os.environ['RUSTFS_BUILD_VERSION']
+          package = dist / f'rustfs-linux-x86_64-gnu-v{version}.zip'
+          base = '46337942d55f3a8e6a97b147ca98d9ea8115555d'
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          def digest(path):
+              with path.open('rb') as handle:
+                  return hashlib.file_digest(handle, 'sha256').hexdigest()
+          catalog_path = binary.with_name('rustfs.cpu-symbol-catalog.json')
+          catalog_digest = digest(catalog_path)
+          if catalog_path.with_suffix('.sha256').read_text().strip() != catalog_digest:
+              raise SystemExit('CPU symbol catalog checksum mismatch')
+          catalog = json.loads(catalog_path.read_text())
+          if (catalog['sourceCommit'], catalog['executableSha256'], catalog['architecture']) != (commit, digest(binary), 'x86_64'):
+              raise SystemExit('CPU symbol catalog does not match this release executable')
+          if 'pyroscope' not in catalog['buildFeatures']:
+              raise SystemExit('CPU symbol catalog is missing the production profiler feature')
+          patch = subprocess.check_output(['git', 'diff', base, '--', 'crates/ecstore/src/cluster/rpc/remote_locker.rs'])
+          manifest = {
+              'version': version, 'upstream_tag': '1.0.4', 'upstream_commit': base,
+              'patched_commit': commit, 'patch_sha256': hashlib.sha256(patch).hexdigest(),
+              'cargo_lock_sha256': digest(root / 'Cargo.lock'),
+              'rustc': subprocess.check_output(['rustc', '--version', '--verbose'], text=True).strip(),
+              'cargo': subprocess.check_output(['cargo', '--version'], text=True).strip(),
+              'target': target, 'build_os': os.environ['BUILD_OS'],
+              'default_features': True, 'extra_features': ['pyroscope'],
+              'profile': {'name': 'release', 'opt_level': 3, 'lto': 'thin', 'codegen_units': 1, 'debug': 0, 'strip': 'none'},
+              'deployment_glibc_ceiling': '2.41',
+              'console': {'tag': 'v0.1.37', 'sha256': 'e6ff2c7e7695de824ec4cda91d8611d1aba5d8462e6809592c92a50b23f5b9ab'},
+              'binary_sha256': digest(binary), 'package_file': package.name, 'package_sha256': digest(package),
+              'cpu_symbol_catalog_sha256': catalog_digest,
+              'workflow_run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          (dist / 'provenance.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          checksums = [f'{digest(path)}  {path.name}' for path in sorted(dist.iterdir()) if path.is_file() and path.name != 'SHA256SUMS']
+          (dist / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n')
+          PY
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+      - name: Preserve release artifact and logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustfs-1.0.4-ixbt-linux-x86_64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve failed release diagnostics
+        if: failure() && steps.checkout.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustfs-release-failure-${{ github.sha }}
+          path: |
+            dist/*.log
+            dist/*.txt
+          if-no-files-found: ignore
+          retention-days: 14

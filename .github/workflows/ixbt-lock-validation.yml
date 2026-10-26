@@ -15,10 +15,10 @@ concurrency:
 jobs:
   native-linux:
     if: github.repository == 'ixbtcom/rustfs'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
     timeout-minutes: 90
     env:
-      CARGO_BUILD_JOBS: '4'
+      CARGO_BUILD_JOBS: '16'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -26,7 +26,61 @@ jobs:
       RUST_BACKTRACE: '1'
       NO_PROXY: 'localhost,127.0.0.1,::1'
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - &self_hosted_gate
+        id: runner_gate
+        name: Gate the dedicated self-hosted builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -un)" = github-runner
+          test "$(id -u)" -ne 0
+          test "$RUNNER_NAME" = ci-runner-2
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          sudo -n true
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          gib = 1024 ** 3
+          memory = int(next(line.split()[1] for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))) * 1024
+          cgroup_root = pathlib.Path('/sys/fs/cgroup')
+          cgroups = {cgroup_root}
+          for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines():
+              if line.startswith('0::'):
+                  relative = pathlib.PurePosixPath(line.split('::', 1)[1].lstrip('/'))
+                  if '..' not in relative.parts:
+                      current = cgroup_root / relative
+                      while current.is_relative_to(cgroup_root):
+                          cgroups.add(current)
+                          if current == cgroup_root:
+                              break
+                          current = current.parent
+          cpu = len(os.sched_getaffinity(0))
+          for directory in cgroups:
+              limit = directory / 'memory.max'
+              if limit.is_file() and (value := limit.read_text().strip()) != 'max':
+                  memory = min(memory, int(value))
+              quota = directory / 'cpu.max'
+              if quota.is_file():
+                  maximum, period = quota.read_text().split()
+                  if maximum != 'max':
+                      cpu = min(cpu, int(maximum) // int(period))
+          disk = shutil.disk_usage('.').free
+          print(f'effective_memory_bytes={memory}, effective_cpus={cpu}, free_disk_bytes={disk}')
+          if memory < 60 * gib or cpu < 16 or disk < 40 * gib:
+              raise SystemExit('builder requires at least 60 GiB effective RAM, 16 CPUs and 40 GiB free disk')
+          PY
+          tool_cache="${RUNNER_TOOL_CACHE:?runner tool cache is required}"
+          mkdir -p "$tool_cache"
+          test -w "$tool_cache"
+          printf 'Runner tool cache: %s\n' "$tool_cache"
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+            ca-certificates curl git python3 unzip zip cmake liblzma-dev \
+            binutils file jq time build-essential pkg-config libssl-dev ripgrep
+      - id: checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -44,9 +98,8 @@ jobs:
           install-test-tools: 'false'
           cache-shared-key: lock-cancellation-1.0.4-1.99
           cache-save-if: 'true'
-      - name: Native build dependencies and formatter
+      - name: Native formatter and toolchain identity
         run: |
-          sudo apt-get install -y cmake liblzma-dev
           rustup component add rustfmt --toolchain 1.99.0
           rustc --version --verbose
           cargo --version
@@ -78,8 +131,19 @@ jobs:
           set -o pipefail
           cargo check --locked -p rustfs --bin rustfs --features pyroscope 2>&1 | tee binary-check.log
           git diff --exit-code -- Cargo.lock
+      - name: Record native validation resource snapshot
+        if: always() && steps.checkout.outcome == 'success'
+        run: |
+          {
+            date -u --iso-8601=seconds
+            free -m
+            df -h .
+            grep -H . /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak \
+              /sys/fs/cgroup/memory.events /sys/fs/cgroup/cpu.stat \
+              /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null || true
+          } | tee resource-snapshot.txt
       - name: Preserve validation logs
-        if: always()
+        if: always() && steps.checkout.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: lock-validation-${{ github.sha }}
@@ -87,16 +151,17 @@ jobs:
             baseline-test.log
             lock-tests.log
             binary-check.log
+            resource-snapshot.txt
           if-no-files-found: ignore
           retention-days: 14
 
   release-linux:
     if: github.repository == 'ixbtcom/rustfs'
     needs: native-linux
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: '4'
+      CARGO_BUILD_JOBS: '16'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       RUSTUP_TOOLCHAIN: '1.99.0'
@@ -104,25 +169,18 @@ jobs:
       BUILD_OS: linux-x86_64
       NO_PROXY: 'localhost,127.0.0.1,::1'
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - *self_hosted_gate
+      - id: checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Gate source and hosted runner resources
+      - name: Gate exact release source
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor 46337942d55f3a8e6a97b147ca98d9ea8115555d HEAD
           git diff --exit-code 46337942d55f3a8e6a97b147ca98d9ea8115555d -- Cargo.toml Cargo.lock
-          python3 - <<'PY'
-          import pathlib, shutil
-          gib = 1024 ** 3
-          disk = shutil.disk_usage('.').free
-          memory = int(next(line.split()[1] for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))) * 1024
-          print(f'free_disk_bytes={disk}, total_memory_bytes={memory}')
-          if disk < 30 * gib or memory < 12 * gib:
-              raise SystemExit('release build requires at least 30 GiB free disk and 12 GiB RAM')
-          PY
           printf 'RUSTFS_BUILD_VERSION=1.0.4+ixbt.%s\n' "$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
           mkdir -p dist
       - uses: ./.github/actions/setup
@@ -134,8 +192,6 @@ jobs:
           install-test-tools: 'false'
           cache-shared-key: lock-cancellation-release-1.0.4-1.99
           cache-save-if: 'true'
-      - name: Install native release prerequisites
-        run: sudo apt-get install -y cmake liblzma-dev binutils file unzip zip
       - name: Prepare pinned embedded console
         shell: bash
         run: |
@@ -153,7 +209,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked --target "$BUILD_TARGET" -p rustfs --bin rustfs \
+          # time reports a process/child maximum, not the whole CT's memory peak.
+          /usr/bin/time -v cargo build --release --locked --target "$BUILD_TARGET" -p rustfs --bin rustfs \
             --features pyroscope --config 'profile.release.strip="none"' 2>&1 | tee dist/release-build.log
           git diff --exit-code -- Cargo.lock
       - name: Verify release executable and deployment ABI
@@ -193,6 +250,19 @@ jobs:
           cargo run --locked -p rustfs-connect-symbol-catalog -- \
             "$release_dir/rustfs" "$(git rev-parse HEAD)" "$BUILD_TARGET" "$features" \
             "$release_dir/rustfs.cpu-symbol-catalog.json" > "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+      - name: Record release resource snapshot
+        if: always() && steps.checkout.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p dist
+          {
+            date -u --iso-8601=seconds
+            free -m
+            df -h .
+            grep -H . /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak \
+              /sys/fs/cgroup/memory.events /sys/fs/cgroup/cpu.stat \
+              /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null || true
+          } | tee dist/resource-snapshot.txt
       - name: Package and verify installable release
         shell: bash
         run: |
@@ -265,7 +335,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Preserve failed release diagnostics
-        if: failure()
+        if: failure() && steps.checkout.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: rustfs-release-failure-${{ github.sha }}

@@ -7,3 +7,4 @@ self-hosted-runner:
     - dind-sm-standard-2
     - smoke-testing
     - pf-testing
+    - ixbt-rustfs-builder

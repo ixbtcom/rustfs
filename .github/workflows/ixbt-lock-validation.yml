@@ -1,0 +1,91 @@
+name: Lock cancellation validation
+
+on:
+  push:
+    branches: [fix/lock-admission-cancellation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lock-cancellation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    if: github.repository == 'ixbtcom/rustfs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      RUST_BACKTRACE: '1'
+      NO_PROXY: 'localhost,127.0.0.1,::1'
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Record source and available resources
+        run: |
+          git rev-parse HEAD
+          sha256sum Cargo.lock
+          df -h .
+          free -h
+      - uses: ./.github/actions/setup
+        with:
+          rust-version: '1.99.0'
+          install-cross-tools: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+          cache-shared-key: lock-cancellation-1.99
+          cache-save-if: 'true'
+      - name: Native build dependencies and formatter
+        run: |
+          sudo apt-get install -y cmake liblzma-dev
+          rustup component add rustfmt --toolchain 1.99.0
+          rustc --version --verbose
+          cargo --version
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Reproduce the unfixed native transport regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=crates/ecstore/src/cluster/rpc/remote_locker.rs
+          trap 'git show "HEAD:$source_file" > "$source_file"' EXIT
+          git show '958c19cee:crates/ecstore/src/cluster/rpc/remote_locker.rs' > "$source_file"
+          cargo test --locked -p rustfs-ecstore --lib --no-run
+          set +e
+          cargo test --locked -p rustfs-ecstore --lib cluster::rpc::remote_locker::tests::transport_cancellation::cancelled_lock_over_tonic_releases_admission_and_late_remote_lock_once -- --exact --test-threads=1 2>&1 | tee baseline-test.log
+          test_rc=${PIPESTATUS[0]}
+          set -e
+          test "$test_rc" -eq 101
+          grep -F 'late tonic response must free admission and issue native UnLockBatch' baseline-test.log
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' baseline-test.log
+      - name: Native remote locker tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p rustfs-ecstore --lib cluster::rpc::remote_locker::tests:: -- --test-threads=1 2>&1 | tee lock-tests.log
+      - name: Check production binary with locked dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --locked -p rustfs --bin rustfs 2>&1 | tee binary-check.log
+          git diff --exit-code -- Cargo.lock
+      - name: Preserve validation logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: lock-validation-${{ github.sha }}
+          path: |
+            baseline-test.log
+            lock-tests.log
+            binary-check.log
+          if-no-files-found: ignore
+          retention-days: 14

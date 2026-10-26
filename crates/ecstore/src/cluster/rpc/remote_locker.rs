@@ -2101,6 +2101,194 @@ mod tests {
         accept_task.abort();
     }
 
+    // Exercise the native RemoteClient through protobuf/HTTP2/TCP rather than a
+    // synthetic execute_rpc future. The small peer follows the existing tonic
+    // test-service pattern in remote_disk.rs; server authentication is outside
+    // this regression's scope.
+    mod transport_cancellation {
+        use super::*;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
+        use tonic::server::NamedService;
+        use tonic::transport::Server;
+
+        #[derive(Default)]
+        struct LockPeerState {
+            entered: tokio::sync::Notify,
+            finish: tokio::sync::Notify,
+            locks: Mutex<Vec<LockId>>,
+            unlocks: Mutex<Vec<LockId>>,
+        }
+
+        #[derive(Clone)]
+        struct LockPeerService(Arc<LockPeerState>);
+
+        impl NamedService for LockPeerService {
+            const NAME: &'static str = "node_service.NodeService";
+        }
+
+        impl<B> tower::Service<http::Request<B>> for LockPeerService
+        where
+            B: HttpBody + Send + 'static,
+            B::Error: Into<StdError> + Send + 'static,
+        {
+            type Response = http::Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, request: http::Request<B>) -> Self::Future {
+                match request.uri().path() {
+                    "/node_service.NodeService/Lock" => {
+                        struct LockSvc(Arc<LockPeerState>);
+                        impl tonic::server::UnaryService<GenerallyLockRequest> for LockSvc {
+                            type Response = GenerallyLockResponse;
+                            type Future = BoxFuture<Response<Self::Response>, tonic::Status>;
+
+                            fn call(&mut self, request: Request<GenerallyLockRequest>) -> Self::Future {
+                                let state = Arc::clone(&self.0);
+                                Box::pin(async move {
+                                    let lock: LockRequest = serde_json::from_str(&request.into_inner().args)
+                                        .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+                                    state.locks.lock().expect("lock list must be available").push(lock.lock_id);
+                                    state.entered.notify_one();
+                                    state.finish.notified().await;
+                                    Ok(Response::new(GenerallyLockResponse {
+                                        success: true,
+                                        error_info: None,
+                                        lock_info: None,
+                                    }))
+                                })
+                            }
+                        }
+                        let state = Arc::clone(&self.0);
+                        Box::pin(async move {
+                            Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                                .unary(LockSvc(state), request)
+                                .await)
+                        })
+                    }
+                    "/node_service.NodeService/UnLockBatch" => {
+                        struct UnlockSvc(Arc<LockPeerState>);
+                        impl tonic::server::UnaryService<BatchGenerallyLockRequest> for UnlockSvc {
+                            type Response = BatchGenerallyLockResponse;
+                            type Future = BoxFuture<Response<Self::Response>, tonic::Status>;
+
+                            fn call(&mut self, request: Request<BatchGenerallyLockRequest>) -> Self::Future {
+                                let state = Arc::clone(&self.0);
+                                Box::pin(async move {
+                                    let mut results = Vec::new();
+                                    for args in request.into_inner().args {
+                                        let lock: LockRequest = serde_json::from_str(&args)
+                                            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+                                        state
+                                            .unlocks
+                                            .lock()
+                                            .expect("unlock list must be available")
+                                            .push(lock.lock_id);
+                                        results.push(GenerallyLockResult {
+                                            success: true,
+                                            error_info: None,
+                                            lock_info: None,
+                                        });
+                                    }
+                                    Ok(Response::new(BatchGenerallyLockResponse { results }))
+                                })
+                            }
+                        }
+                        let state = Arc::clone(&self.0);
+                        Box::pin(async move {
+                            Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                                .unary(UnlockSvc(state), request)
+                                .await)
+                        })
+                    }
+                    _ => Box::pin(async move {
+                        let mut response = http::Response::new(tonic::body::Body::default());
+                        response
+                            .headers_mut()
+                            .insert(tonic::Status::GRPC_STATUS, (tonic::Code::Unimplemented as i32).into());
+                        response
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, tonic::metadata::GRPC_CONTENT_TYPE);
+                        Ok(response)
+                    }),
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn cancelled_lock_over_tonic_releases_admission_and_late_remote_lock_once() {
+            ensure_test_rpc_secret();
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("transport regression requires loopback TCP access");
+            let addr = format!("http://{}", listener.local_addr().expect("listener address must be available"));
+            let state = Arc::new(LockPeerState::default());
+            let incoming = futures_util::stream::unfold(listener, |listener| async {
+                Some((listener.accept().await.map(|(stream, _)| stream), listener))
+            });
+            let service = LockPeerService(Arc::clone(&state));
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("test tonic peer must serve");
+            });
+            reset_lock_peer_health_for_test(&addr);
+            cache_lazy_channel(&addr).await;
+
+            temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("10000"))], async {
+                let client = RemoteClient::new(addr.clone());
+                let request = test_lock_request(Duration::from_secs(5));
+                let expected_id = request.lock_id.clone();
+                let caller = tokio::spawn(async move { client.acquire_lock(&request).await });
+                timeout(Duration::from_secs(5), state.entered.notified())
+                    .await
+                    .expect("native client must reach the tonic Lock service");
+                assert_eq!(*state.locks.lock().unwrap(), vec![expected_id.clone()]);
+                caller.abort();
+                assert!(caller.await.expect_err("caller must be cancelled").is_cancelled());
+                assert_eq!(
+                    lock_peer_health_for_test(&addr).request_in_flight,
+                    1,
+                    "the underlying HTTP2 RPC still owns its admission while its response is gated"
+                );
+                assert!(state.unlocks.lock().unwrap().is_empty());
+
+                state.finish.notify_one();
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let health = lock_peer_health_for_test(&addr);
+                        if health.request_in_flight == 0
+                            && health.detached_rpcs == 0
+                            && health.late_release_in_flight == 0
+                            && state.unlocks.lock().unwrap().len() == 1
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("late tonic response must free admission and issue native UnLockBatch");
+                assert_eq!(*state.unlocks.lock().unwrap(), vec![expected_id]);
+            })
+            .await;
+
+            server.abort();
+            assert!(server.await.expect_err("test server should stop").is_cancelled());
+            reset_lock_peer_health_for_test(&addr);
+        }
+    }
+
     #[test]
     fn test_is_transport_failure_classifies_only_channel_level_errors() {
         use tonic::{Code, Status};

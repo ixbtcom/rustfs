@@ -31,6 +31,7 @@
 //! replication receive. The source ETag is always recorded under
 //! `odm-source-etag`.
 
+use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
 use super::*;
 
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
@@ -45,6 +46,7 @@ use rustfs_utils::http::{
 
 /// `userIdentity.principalId` of every creation event a write-back emits.
 pub(crate) const ON_DEMAND_MIGRATION_PRINCIPAL_ID: &str = "rustfs-on-demand-migration";
+const EVENT_ODM_WRITE_BACK_FAILED: &str = "odm_write_back_failed";
 
 /// [`OdmWriteBack`] over [`DefaultObjectUsecase`]'s internal put entry
 /// points. The ambient app context is resolved per call: the write-back is
@@ -198,6 +200,20 @@ pub(super) fn write_back_error(err: ApiError) -> WriteBackError {
     if err.message.to_ascii_lowercase().contains("quota exceeded") {
         return WriteBackError::Quota(err.message);
     }
+    let s3_code = match &err.code {
+        S3ErrorCode::Custom(_) => "Custom",
+        code => code.as_str(),
+    };
+    tracing::error!(
+        event = EVENT_ODM_WRITE_BACK_FAILED,
+        component = LOG_COMPONENT_APP,
+        subsystem = LOG_SUBSYSTEM_OBJECT,
+        state = "failed",
+        stage = "local_write_back",
+        reason = "local_write",
+        s3_code,
+        "On-demand migration local write failed"
+    );
     WriteBackError::Local(format!("{}: {}", err.code.as_str(), err.message))
 }
 
@@ -1274,6 +1290,55 @@ mod tests {
         );
         assert!(!ctx.emit_events);
         assert_eq!(ctx.tags, None);
+    }
+
+    #[test]
+    fn write_back_error_logs_safe_api_code_without_sensitive_message() {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock captured log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let err = ApiError {
+                code: S3ErrorCode::InternalError,
+                message: "private-object-key credential=private-token".to_string(),
+                source: None,
+            };
+            assert!(matches!(write_back_error(err), WriteBackError::Local(_)));
+            let custom = ApiError {
+                code: S3ErrorCode::Custom("private-custom-code".into()),
+                message: "private-object-key credential=private-token".to_string(),
+                source: None,
+            };
+            assert!(matches!(write_back_error(custom), WriteBackError::Local(_)));
+        });
+        let bytes = buffer.0.lock().expect("read captured log buffer").clone();
+        let log = String::from_utf8(bytes).expect("captured log is UTF-8");
+        assert!(log.contains("odm_write_back_failed"), "the local failure must emit a diagnostic event");
+        assert!(log.contains("InternalError"), "the diagnostic must retain the bounded S3 API code");
+        assert!(log.contains("Custom"), "custom API codes must use one bounded diagnostic label");
+        assert!(log.contains("local_write_back"), "the diagnostic must retain the local adapter stage");
+        assert!(!log.contains("private-object-key"), "object keys must not enter the diagnostic");
+        assert!(
+            !log.contains("private-token"),
+            "credentials in error strings must not enter the diagnostic"
+        );
+        assert!(!log.contains("private-custom-code"), "custom API codes are not trusted diagnostic labels");
     }
 
     #[test]

@@ -16,7 +16,7 @@ jobs:
   native-linux:
     if: github.repository == 'ixbtcom/rustfs'
     runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: '16'
       CARGO_INCREMENTAL: '0'
@@ -125,6 +125,60 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked -p rustfs-ecstore --lib cluster::rpc::remote_locker::tests:: -- --test-threads=1 2>&1 | tee lock-tests.log
+      - name: Native capability retry and observability regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p rustfs-ecstore --lib cluster::rpc::internode_data_transport::tests:: -- --test-threads=1 2>&1 | tee capability-cache-tests.log
+          cargo test --locked -p rustfs-ecstore --lib test_remote_disk_create_file_retry_uses_fresh_capability_and_writer_connections -- --test-threads=1 2>&1 | tee capability-retry-test.log
+          cargo test --locked -p rustfs-ecstore --lib test_remote_disk_create_file_retries_superseded_capability_once_without_retrying_auth_errors -- --test-threads=1 2>&1 | tee capability-superseded-test.log
+          cargo test --locked -p rustfs-ecstore --lib test_remote_disk_walk_dir_ -- --test-threads=1 2>&1 | tee walk-dir-retry-tests.log
+          cargo test --locked -p rustfs-ecstore --lib set_disk::ops::object::inline_put_commit_path_tests::writer_setup_quorum_failure_is_counted_once_without_encode_failure -- --exact --test-threads=1 2>&1 | tee writer-setup-test.log
+          cargo test --locked -p rustfs-obs --lib telemetry::otel::tests::test_get_object_duration_histogram -- --test-threads=1 2>&1 | tee duration-buckets-test.log
+          cargo test --locked -p rustfs --lib app::object::on_demand_migration_put::tests::write_back_error -- --test-threads=1 2>&1 | tee backfill-diagnostic-test.log
+          for result in capability-cache-tests.log capability-retry-test.log capability-superseded-test.log walk-dir-retry-tests.log; do
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$result"
+          done
+          grep -F 'test result: ok. 1 passed; 0 failed;' writer-setup-test.log
+          grep -F 'test result: ok. 3 passed; 0 failed;' duration-buckets-test.log
+          grep -F 'test result: ok. 2 passed; 0 failed;' backfill-diagnostic-test.log
+      - name: Native heal rollback ownership and staging regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for regression in \
+            heal_rollback_backup_selection_preserves_legacy_peer_semantics \
+            non_inline_heal_preserves_backup_after_publication_fence_loss \
+            cancelled_heal_backup_cleanup_retains_key_owner_until_unlink_finishes \
+            heal_reclaims_published_inline_backup_and_preserves_child_key \
+            heal_mrf_inline_overwrite_does_not_strand_rollback_backup \
+            inline_heal_staged_backup_restores_metadata_after_commit_failure \
+            heal_rename_outcome_matrix_reports_partial_and_retries_failed_targets \
+            deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards \
+            read_repair_commit_aborts_when_object_changes_before_final_rename \
+            delete_recovery_set_legacy_requires_explicit_removal \
+            delete_recovery_marker_source_heal_preserves_foreign_history_and_damaged_data; do
+            cargo test --locked -p rustfs-ecstore --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-$regression.log"
+            grep -F 'test result: ok. 1 passed; 0 failed;' "heal-$regression.log"
+          done
+          cargo test --locked -p rustfs-ecstore --features test-util --test inline_heal_staging_test -- --test-threads=1 2>&1 | tee heal-production-staging.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' heal-production-staging.log
+      - name: Native orphan cleanup safety and authenticated probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for regression in \
+            orphan_data_dir \
+            delete_recovery_evidence_ \
+            delete_recovery_cancelled_evidence_probe_drops_private_session \
+            delete_recovery_raw_discovery; do
+            cargo test --locked -p rustfs-ecstore --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-safety-$regression.log"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "heal-safety-$regression.log"
+          done
+          for regression in orphan_data_dir delete_recovery_exists; do
+            cargo test --locked -p rustfs --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-rpc-$regression.log"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "heal-rpc-$regression.log"
+          done
       - name: Check production binary with locked dependencies
         shell: bash
         run: |
@@ -150,6 +204,14 @@ jobs:
           path: |
             baseline-test.log
             lock-tests.log
+            capability-cache-tests.log
+            capability-retry-test.log
+            capability-superseded-test.log
+            walk-dir-retry-tests.log
+            writer-setup-test.log
+            duration-buckets-test.log
+            backfill-diagnostic-test.log
+            heal-*.log
             binary-check.log
             resource-snapshot.txt
           if-no-files-found: ignore
@@ -306,7 +368,7 @@ jobs:
               raise SystemExit('CPU symbol catalog does not match this release executable')
           if 'pyroscope' not in catalog['buildFeatures']:
               raise SystemExit('CPU symbol catalog is missing the production profiler feature')
-          patch = subprocess.check_output(['git', 'diff', base, '--', 'crates/ecstore/src/cluster/rpc/remote_locker.rs'])
+          patch = subprocess.check_output(['git', 'diff', '--no-ext-diff', '--binary', base, commit, '--'])
           manifest = {
               'version': version, 'upstream_tag': '1.0.4', 'upstream_commit': base,
               'patched_commit': commit, 'patch_sha256': hashlib.sha256(patch).hexdigest(),

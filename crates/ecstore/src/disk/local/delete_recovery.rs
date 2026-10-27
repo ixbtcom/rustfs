@@ -19,6 +19,157 @@ struct DiscoverySession {
     touched: Instant,
 }
 
+impl DiscoverySession {
+    /// Consume one bounded step without changing the existing discovery parser.
+    fn advance(mut self, limit: u32) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>)> {
+        if self.frames.is_empty() {
+            match std::fs::read_dir(&self.root) {
+                Ok(entries) => self.frames.push((String::new(), entries)),
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    return Ok((Vec::new(), None));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut transactions = BTreeSet::new();
+        let mut visited = 0usize;
+        while !self.frames.is_empty()
+            && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
+            && visited < 4096
+        {
+            let (parent, entries) = self
+                .frames
+                .last_mut()
+                .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidData))?;
+            let entry = match entries.next() {
+                Some(entry) => entry?,
+                None => {
+                    self.frames.pop();
+                    continue;
+                }
+            };
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
+            if !safe_path(&name, false) || name.contains('/') {
+                return Err(std::io::Error::from(ErrorKind::InvalidData));
+            }
+            let relative = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            let path = self.root.join(&relative);
+            reject_local_disk_symlink_components(&self.root, &path).map_err(std::io::Error::from)?;
+            let kind = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if !kind.is_dir() && !kind.is_file() {
+                return Err(std::io::Error::from(ErrorKind::InvalidData));
+            }
+            visited += 1;
+            if kind.is_file() {
+                let bound = match self.object.as_deref() {
+                    Some(object) if !parent.is_empty() && !parent.contains('/') => Some((object, parent.as_str())),
+                    Some(_) => None,
+                    None => parent.rsplit_once('/'),
+                };
+                if let Some((object, id)) = bound {
+                    let transaction =
+                        if [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name.as_str()) {
+                            Uuid::parse_str(id).ok().filter(|id| !id.is_nil())
+                        } else {
+                            [
+                                DELETE_DATA_DIR_MARKER_PREFIX,
+                                RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+                                RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+                            ]
+                            .iter()
+                            .find_map(|prefix| delete_transaction_marker_id(&name, prefix))
+                        };
+                    if let Some(transaction) = transaction {
+                        let physical = match self.object.as_ref() {
+                            Some(_) => self.root.clone(),
+                            None => self.root.join(object),
+                        };
+                        if name == STORAGE_FORMAT_FILE_BACKUP
+                            && live_write_backup(&physical, transaction).map_err(std::io::Error::from)?
+                        {
+                            continue;
+                        }
+                        let proof_root = physical.join(transaction.to_string());
+                        let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
+                        let receipt =
+                            regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
+                        let record = match prepared {
+                            Some(bytes) => {
+                                Some(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).map_err(std::io::Error::other)?)
+                            }
+                            None => receipt
+                                .filter(|bytes| !bytes.is_empty())
+                                .map(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).map(|receipt| receipt.journal))
+                                .transpose()
+                                .map_err(std::io::Error::other)?,
+                        };
+                        let logical = if let Some(journal) = record {
+                            let bound_path = match self.object.as_ref() {
+                                Some(scope) if scope == &journal.object => physical.clone(),
+                                Some(_) => return Err(std::io::Error::from(ErrorKind::InvalidData)),
+                                None => build_local_disk_object_path(&self.root, "", &journal.object).1,
+                            };
+                            if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+                                || journal.volume != self.volume
+                                || journal.transaction != transaction
+                                || !safe_path(&journal.object, false)
+                                || bound_path != physical
+                            {
+                                return Err(std::io::Error::from(ErrorKind::InvalidData));
+                            }
+                            journal.object
+                        } else {
+                            object.to_owned()
+                        };
+                        transactions.insert((logical, transaction));
+                    }
+                }
+            } else {
+                if self.object.is_some() && (!parent.is_empty() || !Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil())) {
+                    continue;
+                }
+                // A valid 1024-byte key can exceed 256 one-byte path
+                // components; allow its transaction/data directories too.
+                if self.frames.len() >= 1024 {
+                    return Err(std::io::Error::from(ErrorKind::InvalidData));
+                }
+                self.frames.push((relative, std::fs::read_dir(path)?));
+            }
+        }
+        let transactions = transactions
+            .into_iter()
+            .map(|(object, transaction)| DeleteTransactionId { object, transaction })
+            .collect();
+        let next = (!self.frames.is_empty()).then_some(self);
+        Ok((transactions, next))
+    }
+
+    async fn has_evidence(mut self, disk: &LocalDisk, path: &Path) -> Result<bool> {
+        loop {
+            let (transactions, next) = disk.advance_delete_discovery(path, self, 1).await?;
+            if !transactions.is_empty() {
+                return Ok(true);
+            }
+            let Some(mut next) = next else {
+                return Ok(false);
+            };
+            next.touched = Instant::now();
+            self = next;
+        }
+    }
+}
+
 static DISCOVERY_SESSIONS: std::sync::LazyLock<ParkingLotMutex<HashMap<Uuid, DiscoverySession>>> =
     std::sync::LazyLock::new(|| ParkingLotMutex::new(HashMap::new()));
 
@@ -860,6 +1011,88 @@ impl LocalDisk {
         .await
         .map_err(to_file_error)?
     }
+    fn delete_discovery_path(&self, volume: &str, object: Option<&str>) -> Result<PathBuf> {
+        if !safe_path(volume, false) || volume.contains('/') || object.is_some_and(|object| !safe_path(object, false)) {
+            return Err(DiskError::InvalidPath);
+        }
+        match object {
+            Some(object) => self.io_get_object_path(volume, object),
+            None => self.io_get_bucket_path(volume),
+        }
+    }
+
+    fn new_delete_discovery_session(&self, volume: &str, object: Option<&str>, path: &Path) -> Result<DiscoverySession> {
+        #[cfg(target_os = "linux")]
+        let (mount, root) = {
+            use std::os::fd::AsRawFd;
+            let mount = self.mount_lease.try_clone().map_err(to_file_error)?;
+            let root = PathBuf::from(format!("/proc/self/fd/{}/.", mount.as_raw_fd())).join(volume);
+            let root = match object {
+                Some(object) => root.join(object),
+                None => root,
+            };
+            let _ = path;
+            (mount, root)
+        };
+        #[cfg(windows)]
+        let (mount, root) = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            };
+            let mount = std::fs::OpenOptions::new()
+                .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(self.io_root())
+                .map_err(to_file_error)?;
+            (mount, path.to_owned())
+        };
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
+        let (mount, root) = (std::fs::File::open(self.io_root()).map_err(to_file_error)?, path.to_owned());
+        Ok(DiscoverySession {
+            disk_root: self.io_root().to_path_buf(),
+            volume: volume.to_owned(),
+            object: object.map(str::to_owned),
+            root,
+            _mount: mount,
+            frames: Vec::new(),
+            touched: Instant::now(),
+        })
+    }
+
+    fn validate_delete_discovery_owner(&self, session: &DiscoverySession) -> Result<()> {
+        if session.disk_root != self.io_root() || session.touched.elapsed() > Duration::from_secs(300) {
+            return Err(DiskError::InvalidPath);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let before = session._mount.metadata().map_err(to_file_error)?;
+            #[cfg(target_os = "linux")]
+            let current = self.mount_lease.metadata().map_err(to_file_error)?;
+            #[cfg(not(target_os = "linux"))]
+            let current = std::fs::metadata(self.io_root()).map_err(to_file_error)?;
+            if before.dev() != current.dev() || before.ino() != current.ino() {
+                return Err(DiskError::InvalidPath);
+            }
+        }
+        Ok(())
+    }
+
+    async fn advance_delete_discovery(
+        &self,
+        path: &Path,
+        session: DiscoverySession,
+        limit: u32,
+    ) -> Result<(Vec<DeleteTransactionId>, Option<DiscoverySession>)> {
+        let lease = os::acquire_namespace_mutation_lease_with_owner(path, None).await;
+        self.validate_delete_discovery_owner(&session)?;
+        os::run_blocking_namespace_operation(lease, move || session.advance(limit))
+            .await
+            .map_err(|error| to_file_error(error).into())
+    }
+
     pub(super) async fn delete_recovery_discover(
         &self,
         volume: &str,
@@ -867,237 +1100,43 @@ impl LocalDisk {
         cursor: Option<DeleteRecoveryCursor>,
         limit: u32,
     ) -> Result<DeleteRecoveryPage> {
-        if !(1..=256).contains(&limit)
-            || !safe_path(volume, false)
-            || volume.contains('/')
-            || object.is_some_and(|object| !safe_path(object, false))
-        {
+        if !(1..=256).contains(&limit) {
             return Err(DiskError::InvalidPath);
         }
-        let bucket_path = match object {
-            Some(object) => self.io_get_object_path(volume, object)?,
-            None => self.io_get_bucket_path(volume)?,
-        };
-        let disk_root = self.io_root().to_path_buf();
-        let (token, mut session) = if let Some(cursor) = cursor {
+        let path = self.delete_discovery_path(volume, object)?;
+        let (token, session) = if let Some(cursor) = cursor {
             let session = DISCOVERY_SESSIONS
                 .lock()
                 .remove(&cursor.token)
                 .ok_or(DiskError::FileNotFound)?;
-            if session.disk_root != disk_root
-                || session.volume != volume
-                || session.object.as_deref() != object
-                || session.touched.elapsed() > Duration::from_secs(300)
-            {
+            if session.volume != volume || session.object.as_deref() != object {
                 return Err(DiskError::InvalidPath);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let before = session._mount.metadata().map_err(to_file_error)?;
-                #[cfg(target_os = "linux")]
-                let current = self.mount_lease.metadata().map_err(to_file_error)?;
-                #[cfg(not(target_os = "linux"))]
-                let current = std::fs::metadata(self.io_root()).map_err(to_file_error)?;
-                if before.dev() != current.dev() || before.ino() != current.ino() {
-                    return Err(DiskError::InvalidPath);
-                }
             }
             (cursor.token, session)
         } else {
-            #[cfg(target_os = "linux")]
-            let (mount, root) = {
-                use std::os::fd::AsRawFd;
-                let mount = self.mount_lease.try_clone().map_err(to_file_error)?;
-                let root = PathBuf::from(format!("/proc/self/fd/{}/.", mount.as_raw_fd())).join(volume);
-                let root = match object {
-                    Some(object) => root.join(object),
-                    None => root,
-                };
-                (mount, root)
-            };
-            #[cfg(windows)]
-            let (mount, root) = {
-                use std::os::windows::fs::OpenOptionsExt;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-                };
-                // Match the existing publication-root directory open contract.
-                let mount = std::fs::OpenOptions::new()
-                    .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                    .open(self.io_root())
-                    .map_err(to_file_error)?;
-                (mount, bucket_path.clone())
-            };
-            #[cfg(all(not(target_os = "linux"), not(windows)))]
-            let (mount, root) = (std::fs::File::open(self.io_root()).map_err(to_file_error)?, bucket_path.clone());
-            (
-                Uuid::new_v4(),
-                DiscoverySession {
-                    disk_root,
-                    volume: volume.to_owned(),
-                    object: object.map(str::to_owned),
-                    root,
-                    _mount: mount,
-                    frames: Vec::new(),
-                    touched: Instant::now(),
-                },
-            )
+            (Uuid::new_v4(), self.new_delete_discovery_session(volume, object, &path)?)
         };
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&bucket_path, None).await;
-        os::run_blocking_namespace_operation(lease, move || {
-            if session.frames.is_empty() {
-                match std::fs::read_dir(&session.root) {
-                    Ok(entries) => session.frames.push((String::new(), entries)),
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
-                        return Ok(DeleteRecoveryPage {
-                            transactions: Vec::new(),
-                            next: None,
-                        });
-                    }
-                    Err(err) => return Err(err),
-                }
+        let (transactions, session) = self.advance_delete_discovery(&path, session, limit).await?;
+        let next = if let Some(mut session) = session {
+            session.touched = Instant::now();
+            let mut sessions = DISCOVERY_SESSIONS.lock();
+            sessions.retain(|_, session| session.touched.elapsed() <= Duration::from_secs(300));
+            if sessions.len() >= 128 {
+                return Err(DiskError::Io(std::io::Error::from(ErrorKind::WouldBlock)));
             }
-            let mut transactions = BTreeSet::new();
-            let mut visited = 0usize;
-            while !session.frames.is_empty()
-                && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
-                && visited < 4096
-            {
-                let (parent, entries) = session
-                    .frames
-                    .last_mut()
-                    .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidData))?;
-                let entry = match entries.next() {
-                    Some(entry) => entry?,
-                    None => {
-                        session.frames.pop();
-                        continue;
-                    }
-                };
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
-                if !safe_path(&name, false) || name.contains('/') {
-                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                }
-                let relative = if parent.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{parent}/{name}")
-                };
-                let path = session.root.join(&relative);
-                reject_local_disk_symlink_components(&session.root, &path).map_err(std::io::Error::from)?;
-                let kind = match std::fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
-                };
-                if !kind.is_dir() && !kind.is_file() {
-                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                }
-                visited += 1;
-                if kind.is_file() {
-                    let bound = match session.object.as_deref() {
-                        Some(object) if !parent.is_empty() && !parent.contains('/') => Some((object, parent.as_str())),
-                        Some(_) => None,
-                        None => parent.rsplit_once('/'),
-                    };
-                    if let Some((object, id)) = bound {
-                        let transaction =
-                            if [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name.as_str()) {
-                                Uuid::parse_str(id).ok().filter(|id| !id.is_nil())
-                            } else {
-                                [
-                                    DELETE_DATA_DIR_MARKER_PREFIX,
-                                    RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
-                                    RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
-                                ]
-                                .iter()
-                                .find_map(|prefix| delete_transaction_marker_id(&name, prefix))
-                            };
-                        if let Some(transaction) = transaction {
-                            let physical = match session.object.as_ref() {
-                                Some(_) => session.root.clone(),
-                                None => session.root.join(object),
-                            };
-                            if name == STORAGE_FORMAT_FILE_BACKUP
-                                && live_write_backup(&physical, transaction).map_err(std::io::Error::from)?
-                            {
-                                continue;
-                            }
-                            let proof_root = physical.join(transaction.to_string());
-                            let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
-                            let receipt =
-                                regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
-                            let record = match prepared {
-                                Some(bytes) => {
-                                    Some(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).map_err(std::io::Error::other)?)
-                                }
-                                None => receipt
-                                    .filter(|bytes| !bytes.is_empty())
-                                    .map(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).map(|receipt| receipt.journal))
-                                    .transpose()
-                                    .map_err(std::io::Error::other)?,
-                            };
-                            let logical = if let Some(journal) = record {
-                                let bound_path = match session.object.as_ref() {
-                                    Some(scope) if scope == &journal.object => physical.clone(),
-                                    Some(_) => return Err(std::io::Error::from(ErrorKind::InvalidData)),
-                                    None => build_local_disk_object_path(&session.root, "", &journal.object).1,
-                                };
-                                if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
-                                    || journal.volume != session.volume
-                                    || journal.transaction != transaction
-                                    || !safe_path(&journal.object, false)
-                                    || bound_path != physical
-                                {
-                                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                                }
-                                journal.object
-                            } else {
-                                object.to_owned()
-                            };
-                            transactions.insert((logical, transaction));
-                        }
-                    }
-                } else {
-                    if session.object.is_some() && (!parent.is_empty() || !Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil())) {
-                        continue;
-                    }
-                    // A valid 1024-byte key can exceed 256 one-byte path
-                    // components; allow its transaction/data directories too.
-                    if session.frames.len() >= 1024 {
-                        return Err(std::io::Error::from(ErrorKind::InvalidData));
-                    }
-                    session.frames.push((relative, std::fs::read_dir(path)?));
-                }
-            }
-            let next = if session.frames.is_empty() {
-                None
-            } else {
-                session.touched = Instant::now();
-                let mut sessions = DISCOVERY_SESSIONS.lock();
-                sessions.retain(|_, session| session.touched.elapsed() <= Duration::from_secs(300));
-                if sessions.len() >= 128 {
-                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                }
-                sessions.insert(token, session);
-                Some(DeleteRecoveryCursor { token })
-            };
-            Ok(DeleteRecoveryPage {
-                transactions: transactions
-                    .into_iter()
-                    .map(|(object, transaction)| DeleteTransactionId { object, transaction })
-                    .collect(),
-                next,
-            })
-        })
-        .await
-        .map_err(|err| to_file_error(err).into())
+            sessions.insert(token, session);
+            Some(DeleteRecoveryCursor { token })
+        } else {
+            None
+        };
+        Ok(DeleteRecoveryPage { transactions, next })
+    }
+
+    pub(super) async fn delete_recovery_has_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        let path = self.delete_discovery_path(volume, Some(object))?;
+        self.new_delete_discovery_session(volume, Some(object), &path)?
+            .has_evidence(self, &path)
+            .await
     }
 
     pub(super) async fn delete_recovery_inspect(
@@ -3806,5 +3845,137 @@ mod tests {
                 .expect("outside remains intact"),
             b"outside bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_evidence_probes_do_not_register_public_cursors() {
+        let (_temp, disk, _, _) = fixture().await;
+        apply(&disk, Uuid::new_v4()).await;
+        for _ in 0..256 {
+            assert!(
+                disk.delete_recovery_has_evidence("recovery", "object")
+                    .await
+                    .expect("positive private probe")
+            );
+        }
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "early positive probes must not consume any public cursor slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_evidence_probe_advances_empty_bounded_pages() {
+        let (_temp, disk, _, _) = fixture().await;
+        let path = disk.delete_discovery_path("recovery", Some("object")).expect("probe scope");
+        let filler_id = Uuid::new_v4().to_string();
+        let filler = path.join(&filler_id);
+        fs::create_dir_all(&filler).await.expect("non-evidence directory");
+        for index in 0..5000 {
+            fs::write(filler.join(format!("part-{index:04}")), [])
+                .await
+                .expect("non-evidence entry");
+        }
+        let session = disk
+            .new_delete_discovery_session("recovery", Some("object"), &path)
+            .expect("private session");
+        let (first, next) = disk
+            .advance_delete_discovery(&path, session, 1)
+            .await
+            .expect("bounded first step");
+        assert!(first.is_empty());
+        assert!(next.is_some(), "an empty 4096-entry step must retain real continuation state");
+        drop(next);
+        assert!(
+            !disk
+                .delete_recovery_has_evidence("recovery", "object")
+                .await
+                .expect("negative probe reaches EOF")
+        );
+
+        let transaction = Uuid::new_v4();
+        let proof = path.join(transaction.to_string());
+        apply(&disk, transaction).await;
+        let mut session = disk
+            .new_delete_discovery_session("recovery", Some("object"), &path)
+            .expect("private late-evidence session");
+        // Seed a valid DFS continuation so this assertion is independent of
+        // filesystem directory ordering: the large empty frame runs first.
+        session.frames = vec![
+            (transaction.to_string(), std::fs::read_dir(&proof).expect("later evidence frame")),
+            (filler_id, std::fs::read_dir(&filler).expect("empty intermediate frame")),
+        ];
+        assert!(
+            session
+                .has_evidence(&disk, &path)
+                .await
+                .expect("late evidence survives an empty intermediate page")
+        );
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "private continuation never enters the public cursor table"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_cancelled_evidence_probe_drops_private_session() {
+        let (_temp, disk, _, _) = fixture().await;
+        apply(&disk, Uuid::new_v4()).await;
+        let path = disk.delete_discovery_path("recovery", Some("object")).expect("probe scope");
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&path, None).await;
+        let mut probe = Box::pin(disk.delete_recovery_has_evidence("recovery", "object"));
+        assert!(
+            futures::poll!(probe.as_mut()).is_pending(),
+            "the private session waits for the held namespace lease"
+        );
+        drop(probe);
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "cancelling before a page runs must not retain a global cursor"
+        );
+        drop(lease);
+        assert!(
+            disk.delete_recovery_has_evidence("recovery", "object")
+                .await
+                .expect("later probes remain live")
+        );
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_evidence_probe_preserves_strict_corrupt_record_errors() {
+        let (_temp, disk, _, _) = fixture().await;
+        let proof = disk
+            .io_get_object_path("recovery", &format!("object/{}", Uuid::new_v4()))
+            .expect("corrupt proof path");
+        fs::create_dir_all(&proof).await.expect("corrupt evidence directory");
+        fs::write(proof.join(PREPARED), b"{invalid journal")
+            .await
+            .expect("corrupt evidence");
+        let error = disk
+            .delete_recovery_has_evidence("recovery", "object")
+            .await
+            .expect_err("corrupt journal fails closed");
+        assert!(
+            matches!(error, DiskError::Io(ref source)
+                if source.kind() == ErrorKind::Other
+                    && source.get_ref().is_some_and(|source| source.is::<serde_json::Error>())),
+            "preserve the existing strict journal parse error: {error:?}"
+        );
+        assert!(proof.join(PREPARED).exists(), "evidence queries must not mutate uncertain records");
     }
 }

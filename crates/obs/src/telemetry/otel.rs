@@ -83,6 +83,14 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+const S3_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &["rustfs_s3_get_object_duration_ms", "rustfs_s3_put_object_duration_ms"];
+
+// These compatibility instruments record milliseconds, unlike the GET pipeline instruments above.
+const S3_OBJECT_DURATION_HISTOGRAM_BUCKETS_MS: &[f64] = &[
+    0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1_000.0, 2_500.0, 5_000.0, 7_500.0, 10_000.0, 20_000.0,
+    30_000.0, 60_000.0, 120_000.0,
+];
+
 const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
 const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
@@ -465,7 +473,7 @@ fn build_meter_provider(
                         .with_interval(Duration::from_secs(meter_interval))
                         .build(),
                 )
-                .with_view(get_object_duration_histogram_view);
+                .with_view(object_duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -480,22 +488,28 @@ fn build_meter_provider(
     Ok(Some(provider))
 }
 
-fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
-    if !is_get_object_duration_histogram_metric(instrument.name()) {
+fn object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    if !is_object_duration_histogram_metric(instrument.name()) {
         return None;
     }
 
+    let boundaries = if S3_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&instrument.name()) {
+        S3_OBJECT_DURATION_HISTOGRAM_BUCKETS_MS
+    } else {
+        GET_OBJECT_DURATION_HISTOGRAM_BUCKETS
+    };
+
     Stream::builder()
         .with_aggregation(Aggregation::ExplicitBucketHistogram {
-            boundaries: GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+            boundaries: boundaries.to_vec(),
             record_min_max: true,
         })
         .build()
         .ok()
 }
 
-fn is_get_object_duration_histogram_metric(name: &str) -> bool {
-    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
+fn is_object_duration_histogram_metric(name: &str) -> bool {
+    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) || S3_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -1098,10 +1112,98 @@ mod tests {
 
     #[test]
     fn test_get_object_duration_histogram_metric_match_is_scoped() {
-        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
-        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
-        assert!(!is_get_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
-        assert!(!is_get_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+        assert!(is_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
+        assert!(is_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
+        assert!(is_object_duration_histogram_metric("rustfs_s3_get_object_duration_ms"));
+        assert!(is_object_duration_histogram_metric("rustfs_s3_put_object_duration_ms"));
+        assert!(!is_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
+        assert!(!is_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_metric_match_is_scoped_to_exported_units() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::metrics::Temporality;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+
+        type ExportedHistograms = HashMap<String, (Vec<f64>, Vec<u64>)>;
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<ExportedHistograms>>);
+        impl PushMetricExporter for Capture {
+            async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+                let mut captured = self.0.lock().expect("lock exported histograms");
+                for scope in metrics.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
+                            for point in histogram.data_points() {
+                                captured.insert(
+                                    metric.name().to_string(),
+                                    (point.bounds().collect(), point.bucket_counts().collect()),
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn temporality(&self) -> Temporality {
+                Temporality::Cumulative
+            }
+        }
+
+        let capture = Capture::default();
+        let reader = PeriodicReader::builder(capture.clone())
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_view(object_duration_histogram_view)
+            .build();
+        let meter = provider.meter("duration-view-regression");
+        let ms_names = ["rustfs_s3_get_object_duration_ms", "rustfs_s3_put_object_duration_ms"];
+        for name in ms_names {
+            let histogram = meter.f64_histogram(name).with_unit("ms").build();
+            for sample in [15_000.0, 25_000.0, 45_000.0, 90_000.0] {
+                histogram.record(sample, &[]);
+            }
+        }
+        let seconds_name = "rustfs_io_get_object_request_duration_seconds";
+        meter.f64_histogram(seconds_name).with_unit("s").build().record(0.5, &[]);
+        provider.force_flush().expect("export duration histograms");
+        let captured = capture.0.lock().expect("read exported histograms").clone();
+        provider.shutdown().expect("shutdown duration histogram provider");
+
+        for name in ms_names {
+            let (bounds, counts) = captured.get(name).expect("S3 duration histogram was exported");
+            assert!(bounds.windows(2).all(|pair| pair[0] < pair[1]));
+            for boundary in [20_000.0, 30_000.0, 60_000.0, 120_000.0] {
+                let index = bounds
+                    .iter()
+                    .position(|value| *value == boundary)
+                    .expect("long requests need finite millisecond buckets");
+                assert_eq!(counts[index], 1, "each long sample must fall in its finite bucket");
+            }
+            assert_eq!(counts.last(), Some(&0), "the long samples must not collapse into +Inf");
+        }
+        let (seconds_bounds, seconds_counts) = captured.get(seconds_name).expect("seconds histogram was exported");
+        assert_eq!(seconds_bounds.first(), Some(&0.0001));
+        assert_eq!(seconds_bounds.last(), Some(&10.0), "the existing seconds view must retain its units");
+        let half_second = seconds_bounds
+            .iter()
+            .position(|value| *value == 0.5)
+            .expect("half-second bucket");
+        assert_eq!(seconds_counts[half_second], 1);
     }
 
     #[test]

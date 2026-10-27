@@ -1409,6 +1409,15 @@ const HTTP_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
     pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
+        Self::with_connection(url, method, headers, false).await
+    }
+
+    /// Keep a pre-body retry independent of a stalled shared connection pool.
+    pub async fn new_fresh_connection(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
+        Self::with_connection(url, method, headers, true).await
+    }
+
+    async fn with_connection(url: String, method: Method, headers: HeaderMap, force_fresh_connection: bool) -> io::Result<Self> {
         // http_log!("[HttpWriter::new] url: {url}, method: {method:?}, headers: {headers:?}");
         let url_clone = url.clone();
         let method_clone = method.clone();
@@ -1436,7 +1445,12 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = match get_http_client(&url_clone).await {
+            let client = if force_fresh_connection {
+                get_fresh_http_client(&url_clone).await
+            } else {
+                get_http_client(&url_clone).await
+            };
+            let client = match client {
                 Ok(client) => client,
                 Err(err) => {
                     record_internode_error(track_internode_metrics, internode_operation);

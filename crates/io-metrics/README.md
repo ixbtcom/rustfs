@@ -169,7 +169,7 @@ Operation-level metrics use the same low-cardinality label set:
 | `rustfs_system_network_internode_operation_classified_errors_total` | `operation`, `backend`, `classification` | Classified internode transport failures. |
 | `rustfs_system_network_internode_operation_retries_total` | `operation`, `backend`, `classification` | Retry attempts for retryable internode transport failures. |
 | `rustfs_system_network_internode_operation_retry_successes_total` | `operation`, `backend`, `classification` | Successful recoveries after retryable internode transport failures. |
-| `rustfs_system_storage_erasure_write_quorum_failures_total` | `stage`, `dominant_error` | Erasure write quorum failures grouped by failure stage and dominant error class. |
+| `rustfs_system_storage_erasure_write_quorum_failures_total` | `stage`, `dominant_error` | Erasure write quorum failures grouped by failure stage and dominant error class, including `writer_setup` failures before encoding. |
 
 Current `operation` values are `read_file_stream`, `put_file_stream`,
 `walk_dir`, `grpc_read_all`, and `grpc_write_all`. Current `backend` values are

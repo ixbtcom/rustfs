@@ -21,6 +21,7 @@
 
 use crate::core::pools::DecommissionCapacityAdmission;
 use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
+use crate::disk::error_reduce::build_write_quorum_failure_summary;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
@@ -4393,6 +4394,8 @@ impl SetDisks {
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
+                let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum);
+                runtime_sources::record_erasure_write_quorum_failure("writer_setup", summary.dominant_error_label);
                 error!(
                     event = EVENT_SET_DISK_WRITE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -13183,6 +13186,40 @@ mod inline_put_commit_path_tests {
         for disk in disks {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
+    }
+
+    #[test]
+    fn writer_setup_quorum_failure_is_counted_once_without_encode_failure() {
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime for writer-setup metric regression");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "writer-setup-metric";
+                make_bucket(&disk_stores, bucket).await;
+                {
+                    let mut disks = set_disks.disks.write().await;
+                    disks[2] = None;
+                    disks[3] = None;
+                }
+                let mut reader = PutObjReader::from_vec(vec![0xa5; 4 * 1024]);
+                set_disks
+                    .put_object(bucket, "below-quorum.bin", &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect_err("two online disks must fail the four-disk writer-setup quorum");
+            });
+        });
+        let counter = "rustfs_system_storage_erasure_write_quorum_failures_total";
+        assert_eq!(
+            recorder.counter_value(counter, &[("stage", "writer_setup")]),
+            1,
+            "pre-encode writer-setup failure must reach the quorum counter"
+        );
+        assert_eq!(recorder.counter_value(counter, &[("stage", "write")]), 0);
+        assert_eq!(recorder.counter_value(counter, &[("stage", "shutdown")]), 0);
     }
 
     #[tokio::test]

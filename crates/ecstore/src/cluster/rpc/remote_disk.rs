@@ -18,8 +18,8 @@ use crate::cluster::rpc::client::{
     node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::internode_data_transport::{
-    InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
-    WriteStreamRequest,
+    InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, PutFileCapabilityProbeSuperseded,
+    ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
@@ -1096,6 +1096,9 @@ impl RemoteDisk {
 
     fn is_retryable_open_write_error(err: &DiskError) -> bool {
         err.is_retryable_internode_write_failure()
+            || matches!(err, DiskError::Io(error) if error.get_ref().is_some_and(|source| {
+                source.is::<PutFileCapabilityProbeSuperseded>()
+            }))
     }
 
     fn is_retryable_open_read_error(err: &DiskError) -> bool {
@@ -1181,7 +1184,12 @@ impl RemoteDisk {
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
-            match self.data_transport.open_write(request.clone()).await {
+            let opened = if attempt == 1 {
+                self.data_transport.open_write(request.clone()).await
+            } else {
+                self.data_transport.open_write_fresh(request.clone()).await
+            };
+            match opened {
                 Ok(writer) => {
                     if attempt > 1
                         && let Some(classification) = last_retry_classification
@@ -3484,16 +3492,18 @@ impl DiskAPI for RemoteDisk {
                 let mut last_err = None;
 
                 for attempt in 1..=2 {
-                    let mut reader = match self
-                        .data_transport
-                        .open_walk_dir(WalkDirStreamRequest {
-                            endpoint: self.endpoint.grid_host(),
-                            disk: disk.clone(),
-                            body: body.clone(),
-                            stall_timeout: Some(stall_timeout),
-                        })
-                        .await
-                    {
+                    let request = WalkDirStreamRequest {
+                        endpoint: self.endpoint.grid_host(),
+                        disk: disk.clone(),
+                        body: body.clone(),
+                        stall_timeout: Some(stall_timeout),
+                    };
+                    let opened = if attempt == 1 {
+                        self.data_transport.open_walk_dir(request).await
+                    } else {
+                        self.data_transport.open_walk_dir_fresh(request).await
+                    };
+                    let mut reader = match opened {
                         Ok(reader) => reader,
                         Err(err) => {
                             if attempt == 1 && Self::is_retryable_walk_dir_error(&err) {
@@ -4976,6 +4986,7 @@ mod tests {
     struct RetryingWalkDirInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         steps: Arc<StdMutex<Vec<WalkDirTestStep>>>,
+        fresh_calls: Arc<AtomicUsize>,
     }
 
     impl RetryingWalkDirInternodeDataTransport {
@@ -4983,6 +4994,7 @@ mod tests {
             Self {
                 calls: Arc::new(StdMutex::new(Vec::new())),
                 steps: Arc::new(StdMutex::new(steps)),
+                fresh_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -5679,6 +5691,11 @@ mod tests {
                     error: Some(error),
                 })),
             }
+        }
+
+        async fn open_walk_dir_fresh(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
+            self.fresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.open_walk_dir(request).await
         }
 
         async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
@@ -8097,6 +8114,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_disk_create_file_retries_superseded_capability_once_without_retrying_auth_errors() {
+        use crate::cluster::rpc::internode_data_transport::PutFileCapabilityProbeSuperseded;
+
+        let superseded = || DiskError::Io(io::Error::other(PutFileCapabilityProbeSuperseded));
+        let auth_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::FORBIDDEN),
+        ));
+        assert!(!RemoteDisk::is_retryable_open_write_error(&auth_error));
+        assert!(!RemoteDisk::is_retryable_open_write_error(&DiskError::other(
+            "remote put_file capability downgrade rejected"
+        )));
+        assert!(
+            !RemoteDisk::is_retryable_open_write_error(&DiskError::other(
+                "put_file capability probe superseded by a newer negotiation"
+            )),
+            "only the typed pre-body marker may trigger this retry"
+        );
+
+        let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![
+            OpenWriteTestStep::Error(superseded()),
+            OpenWriteTestStep::Success,
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let _writer = remote_disk
+            .create_file("orig-bucket", "bucket", "object/part.1", 4096)
+            .await
+            .expect("superseded pre-body open should retain its one retry");
+        assert_eq!(transport.calls().len(), 2);
+
+        let exhausted = RetryingOpenWriteInternodeDataTransport::with_steps(vec![
+            OpenWriteTestStep::Error(superseded()),
+            OpenWriteTestStep::Error(superseded()),
+            OpenWriteTestStep::Success,
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(exhausted.clone())).await;
+        let result = remote_disk.create_file("orig-bucket", "bucket", "object/part.1", 4096).await;
+        assert!(result.is_err(), "supersession must not add a third attempt");
+        assert_eq!(exhausted.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial(internode_metrics)]
+    async fn test_remote_disk_create_file_retry_uses_fresh_capability_and_writer_connections() {
+        use crate::storage_api_contracts::internode::{PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse};
+        use http::{HeaderMap, Method};
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Debug)]
+        struct CapabilityTimeoutThenTcp {
+            endpoint: String,
+            normal_calls: AtomicUsize,
+            fresh_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl InternodeDataTransport for CapabilityTimeoutThenTcp {
+            async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+                panic!("retry test must not read a shard");
+            }
+
+            async fn open_write(&self, mut request: WriteStreamRequest) -> Result<FileWriter> {
+                if self.normal_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(DiskError::from(rustfs_rio::internode_http_timeout_error(
+                        &Method::GET,
+                        &format!("{}/rustfs/rpc/put_file_capability", self.endpoint),
+                    )));
+                }
+                request.endpoint = self.endpoint.clone();
+                TcpHttpInternodeDataTransport.open_write(request).await
+            }
+
+            async fn open_write_fresh(&self, mut request: WriteStreamRequest) -> Result<FileWriter> {
+                self.fresh_calls.fetch_add(1, Ordering::SeqCst);
+                request.endpoint = self.endpoint.clone();
+                TcpHttpInternodeDataTransport.open_write_fresh(request).await
+            }
+
+            async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+                panic!("retry test must not list a shard");
+            }
+
+            fn name(&self) -> &'static str {
+                "capability-timeout-then-tcp"
+            }
+
+            fn capabilities(&self) -> InternodeDataTransportCapabilities {
+                InternodeDataTransportCapabilities::tcp_http()
+            }
+        }
+
+        async fn read_until(socket: &mut tokio::net::TcpStream, suffix: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.expect("test request should be readable");
+                bytes.push(byte[0]);
+                assert!(bytes.len() <= 8192, "test request should be bounded");
+                if bytes.ends_with(suffix) {
+                    return bytes;
+                }
+            }
+        }
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
+        let server_endpoint = endpoint.clone();
+        let server_epoch = Uuid::new_v4();
+        let reused = Arc::new(AtomicBool::new(false));
+        let server_reused = reused.clone();
+        let payload = b"fresh retry";
+        let server = tokio::spawn(async move {
+            let (mut pooled, _) = listener.accept().await.expect("warmup connection");
+            let warmup = read_until(&mut pooled, b"\r\n\r\n").await;
+            assert!(warmup.starts_with(b"GET /warm "));
+            pooled
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n")
+                .await
+                .expect("warmup response");
+
+            let (mut capability, _) = tokio::select! {
+                _ = read_until(&mut pooled, b"\r\n\r\n") => {
+                    server_reused.store(true, Ordering::SeqCst);
+                    std::future::pending::<(tokio::net::TcpStream, std::net::SocketAddr)>().await
+                }
+                accepted = listener.accept() => accepted.expect("fresh capability connection"),
+            };
+            let request = String::from_utf8(read_until(&mut capability, b"\r\n\r\n").await).expect("capability headers");
+            let target = request.split_whitespace().nth(1).expect("capability target");
+            let capability_url = url::Url::parse(&format!("{server_endpoint}{target}")).expect("capability URL");
+            assert_eq!(capability_url.path(), "/rustfs/rpc/put_file_capability");
+            let challenge = capability_url
+                .query_pairs()
+                .find(|(key, _)| key == "put_file_challenge")
+                .and_then(|(_, value)| Uuid::parse_str(&value).ok())
+                .expect("capability challenge");
+            let proof = crate::cluster::rpc::sign_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION)
+                .expect("signed capability response");
+            let body = rmp_serde::to_vec_named(&PutFileCapabilityResponse {
+                version: PUT_FILE_CAPABILITY_VERSION,
+                server_epoch,
+                proof,
+            })
+            .expect("encoded capability response");
+            capability
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes())
+                .await
+                .expect("capability response headers");
+            capability.write_all(&body).await.expect("capability response body");
+            drop(capability);
+
+            let (mut writer, _) = tokio::select! {
+                _ = read_until(&mut pooled, b"\r\n\r\n") => {
+                    server_reused.store(true, Ordering::SeqCst);
+                    std::future::pending::<(tokio::net::TcpStream, std::net::SocketAddr)>().await
+                }
+                accepted = listener.accept() => accepted.expect("fresh writer connection"),
+            };
+            let request = String::from_utf8(read_until(&mut writer, b"\r\n\r\n").await).expect("writer headers");
+            assert!(request.starts_with("PUT /rustfs/rpc/put_file_stream_v1?"));
+            let target = request.split_whitespace().nth(1).expect("writer target");
+            let writer_url = format!("{server_endpoint}{target}");
+            let parsed_url = url::Url::parse(&writer_url).expect("writer URL");
+            assert_eq!(
+                parsed_url
+                    .query_pairs()
+                    .find(|(key, _)| key == "put_file_server_epoch")
+                    .map(|(_, value)| value.into_owned()),
+                Some(server_epoch.to_string()),
+                "fresh writer must retain the authenticated server epoch"
+            );
+            let nonce = parsed_url
+                .query_pairs()
+                .find(|(key, _)| key == "put_file_nonce")
+                .and_then(|(_, value)| Uuid::parse_str(&value).ok())
+                .expect("writer nonce");
+            let mut body = Vec::new();
+            loop {
+                let size = String::from_utf8(read_until(&mut writer, b"\r\n").await).expect("chunk length");
+                let size = usize::from_str_radix(size.trim(), 16).expect("hex chunk length");
+                assert!(size <= 8192, "test body chunk should be bounded");
+                if size == 0 {
+                    assert_eq!(read_until(&mut writer, b"\r\n").await, b"\r\n");
+                    break;
+                }
+                let mut chunk = vec![0_u8; size];
+                writer.read_exact(&mut chunk).await.expect("body chunk");
+                body.extend(chunk);
+                assert!(body.len() <= 8192, "test payload should be bounded");
+                assert_eq!(read_until(&mut writer, b"\r\n").await, b"\r\n");
+            }
+            assert_eq!(&body[..payload.len()], payload);
+            let digest =
+                crate::cluster::rpc::verify_put_file_auth_trailer(&writer_url, &Method::PUT, nonce, &body[payload.len()..])
+                    .expect("shutdown should retain the authenticated payload trailer");
+            assert_eq!(digest, hex_simd::encode_to_string(Sha256::digest(payload), hex_simd::AsciiCase::Lower));
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("writer response");
+        });
+
+        let mut warmup = rustfs_rio::HttpReader::new(format!("{endpoint}/warm"), Method::GET, HeaderMap::new(), None)
+            .await
+            .expect("shared connection warmup");
+        warmup.read_to_end(&mut Vec::new()).await.expect("warmup body should finish");
+        drop(warmup);
+        let transport = Arc::new(CapabilityTimeoutThenTcp {
+            endpoint,
+            normal_calls: AtomicUsize::new(0),
+            fresh_calls: AtomicUsize::new(0),
+        });
+        let remote_disk = new_remote_disk_with_transport(transport.clone()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut writer = remote_disk.create_file("orig-bucket", "bucket", "object/part.1", 11).await?;
+            writer.write_all(payload).await?;
+            writer.shutdown().await?;
+            Ok::<(), DiskError>(())
+        })
+        .await;
+        server.abort();
+        assert!(
+            !reused.load(Ordering::SeqCst),
+            "retry must bypass the stalled pool for both capability and PUT"
+        );
+        result
+            .expect("full retry should finish before the test deadline")
+            .expect("retry should commit the authenticated body");
+        assert_eq!(transport.normal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.fresh_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_remote_disk_append_file_does_not_retry_non_retryable_open_write_error() {
         let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![OpenWriteTestStep::Error(DiskError::from(
             rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::Unknown),
@@ -8443,6 +8697,7 @@ mod tests {
 
         assert_eq!(writer, b"walk-dir-retry-ok");
         assert_eq!(transport.calls().len(), 2, "walk_dir should retry exactly once");
+        assert_eq!(transport.fresh_calls.load(Ordering::SeqCst), 1, "second open must bypass the shared pool");
     }
 
     #[tokio::test]
@@ -8476,6 +8731,7 @@ mod tests {
         assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == io::ErrorKind::ConnectionReset));
         assert_eq!(writer, b"partial-walk-dir");
         assert_eq!(transport.calls().len(), 1, "walk_dir should not retry after writing partial bytes");
+        assert_eq!(transport.fresh_calls.load(Ordering::SeqCst), 0, "partial output must never be replayed");
     }
 
     #[tokio::test]

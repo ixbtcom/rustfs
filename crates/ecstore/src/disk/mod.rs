@@ -231,6 +231,14 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// A read-only probe; the physical delete repeats the same leaf checks.
+    pub async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self {
+            Self::Local(disk) => disk.get_disk().is_plain_orphan_data_dir(volume, path).await,
+            Self::Remote(disk) => disk.is_plain_orphan_data_dir(volume, path).await,
+        }
+    }
+
     pub(crate) async fn delete_versions_with_namespace_owner(
         &self,
         volume: &str,
@@ -377,6 +385,12 @@ impl DiskAPI for Disk {
         match self {
             Self::Local(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
             Self::Remote(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
+        }
+    }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        match self {
+            Self::Local(disk) => disk.has_delete_transaction_evidence(volume, object).await,
+            Self::Remote(disk) => disk.has_delete_transaction_evidence(volume, object).await,
         }
     }
     async fn discover_delete_transactions(
@@ -1410,6 +1424,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         Err(DiskError::MethodNotAllowed)
     }
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
+    /// Exact-key existence owns its traversal state; unsupported peers cannot
+    /// establish the absence of recovery obligations.
+    async fn has_delete_transaction_evidence(&self, _volume: &str, _object: &str) -> Result<bool> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn discover_delete_transactions(
         &self,
         _volume: &str,
@@ -1803,6 +1822,10 @@ pub struct DeleteOptions {
     pub delete_recovery_bucket_incarnation: Option<Uuid>,
     #[serde(default)]
     pub recoverable_delete: bool,
+    /// Reclaim only plain erasure-part leaves, preserving every other entry.
+    /// Keep `recursive` false so an older peer cannot widen this operation.
+    #[serde(default)]
+    pub orphan_data_dir: bool,
 }
 
 pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
@@ -1833,6 +1856,7 @@ pub(crate) fn validate_delete_recovery_options(opts: &DeleteOptions) -> Result<(
         || opts.undo_delete
         || opts.recursive
         || opts.immediate
+        || opts.orphan_data_dir
         || opts.expected_delete_marker.is_some()
         || opts.delete_recovery_bucket_incarnation.is_some_and(|id| id.is_nil())
     {
@@ -2012,6 +2036,9 @@ pub enum DeleteRecoveryAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum DeleteRecoveryRpcOperation {
+    InspectOrphanDataDir {
+        path: String,
+    },
     Discover {
         object: Option<String>,
         cursor: Option<DeleteRecoveryCursor>,
@@ -2037,6 +2064,9 @@ pub enum DeleteRecoveryRpcOperation {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     },
+    Exists {
+        object: String,
+    },
 }
 
 impl DeleteRecoveryRpcOperation {
@@ -2057,11 +2087,13 @@ impl DeleteRecoveryRpcOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum DeleteRecoveryRpcReply {
+    OrphanDataDir { plain: bool },
     Discovered(DeleteRecoveryPage),
     Inspected(DeleteRecoveryInspection),
     Settled(DeleteRecoveryInspection),
     AppliedVersion,
     AppliedVersions(Vec<Option<u32>>),
+    Evidence { present: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2354,6 +2386,7 @@ mod tests {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            orphan_data_dir: false,
         };
 
         assert!(opts.recursive);
@@ -2962,5 +2995,89 @@ mod delete_recovery_adoption_tests {
         assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
         journal.requests.clear();
         assert!(!journal.matches_adoption_source(&journal.original_versions));
+    }
+}
+
+#[cfg(test)]
+mod orphan_data_dir_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn delete_recovery_exists_roundtrips_without_cursor_ownership() {
+        let operation = DeleteRecoveryRpcOperation::Exists {
+            object: "object".to_owned(),
+        };
+        assert_eq!(
+            operation.max_wire_payload_bytes(),
+            rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES
+        );
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode exact-key existence probe");
+        assert!(matches!(
+            rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcOperation>(&encoded).expect("decode existence probe"),
+            DeleteRecoveryRpcOperation::Exists { object } if object == "object"
+        ));
+        for present in [false, true] {
+            let encoded = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::Evidence { present }).expect("encode evidence reply");
+            assert!(matches!(
+                rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).expect("decode evidence reply"),
+                DeleteRecoveryRpcReply::Evidence { present: decoded } if decoded == present
+            ));
+        }
+        #[derive(Deserialize)]
+        enum OlderOperation {
+            Discover {
+                _object: Option<String>,
+                _cursor: Option<DeleteRecoveryCursor>,
+                _limit: u32,
+            },
+        }
+        assert!(
+            rustfs_protos::decode_delete_recovery_payload::<OlderOperation>(&encoded).is_err(),
+            "an older peer must reject existence probing instead of reporting absence"
+        );
+    }
+
+    #[test]
+    fn orphan_probe_roundtrips_without_mutation_options() {
+        let path = format!("object/{}", Uuid::new_v4());
+        let operation = DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: path.clone() };
+        assert_eq!(
+            operation.max_wire_payload_bytes(),
+            rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES
+        );
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode orphan probe");
+        let decoded: DeleteRecoveryRpcOperation = rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode probe");
+        assert!(matches!(decoded, DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: decoded } if decoded == path));
+        let reply = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::OrphanDataDir { plain: true }).expect("encode probe reply");
+        assert!(matches!(
+            rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&reply).expect("decode probe reply"),
+            DeleteRecoveryRpcReply::OrphanDataDir { plain: true }
+        ));
+        #[derive(Deserialize)]
+        enum OlderOperation {
+            Inspect { _object: String, _transaction: Uuid },
+        }
+        assert!(
+            rustfs_protos::decode_delete_recovery_payload::<OlderOperation>(&encoded).is_err(),
+            "older peers must reject the additive probe"
+        );
+    }
+
+    #[test]
+    fn orphan_delete_is_nonrecursive_when_older_peer_ignores_new_option() {
+        #[derive(Deserialize)]
+        struct OlderDeleteOptions {
+            recursive: bool,
+            immediate: bool,
+        }
+        let opts = DeleteOptions {
+            orphan_data_dir: true,
+            immediate: true,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_vec(&opts).expect("encode leaf deletion");
+        let old: OlderDeleteOptions = serde_json::from_slice(&encoded).expect("older options ignore additive field");
+        assert!(!old.recursive, "ignoring the new option must never broaden deletion");
+        assert!(old.immediate);
     }
 }

@@ -142,6 +142,43 @@ jobs:
           grep -F 'test result: ok. 1 passed; 0 failed;' writer-setup-test.log
           grep -F 'test result: ok. 3 passed; 0 failed;' duration-buckets-test.log
           grep -F 'test result: ok. 2 passed; 0 failed;' backfill-diagnostic-test.log
+      - name: Native heal rollback ownership and staging regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for regression in \
+            heal_rollback_backup_selection_preserves_legacy_peer_semantics \
+            non_inline_heal_preserves_backup_after_publication_fence_loss \
+            cancelled_heal_backup_cleanup_retains_key_owner_until_unlink_finishes \
+            heal_reclaims_published_inline_backup_and_preserves_child_key \
+            heal_mrf_inline_overwrite_does_not_strand_rollback_backup \
+            inline_heal_staged_backup_restores_metadata_after_commit_failure \
+            heal_rename_outcome_matrix_reports_partial_and_retries_failed_targets \
+            deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards \
+            read_repair_commit_aborts_when_object_changes_before_final_rename \
+            delete_recovery_set_legacy_requires_explicit_removal \
+            delete_recovery_marker_source_heal_preserves_foreign_history_and_damaged_data; do
+            cargo test --locked -p rustfs-ecstore --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-$regression.log"
+            grep -F 'test result: ok. 1 passed; 0 failed;' "heal-$regression.log"
+          done
+          cargo test --locked -p rustfs-ecstore --features test-util --test inline_heal_staging_test -- --test-threads=1 2>&1 | tee heal-production-staging.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' heal-production-staging.log
+      - name: Native orphan cleanup safety and authenticated probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for regression in \
+            orphan_data_dir \
+            delete_recovery_evidence_ \
+            delete_recovery_cancelled_evidence_probe_drops_private_session \
+            delete_recovery_raw_discovery; do
+            cargo test --locked -p rustfs-ecstore --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-safety-$regression.log"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "heal-safety-$regression.log"
+          done
+          for regression in orphan_data_dir delete_recovery_exists; do
+            cargo test --locked -p rustfs --lib "$regression" -- --test-threads=1 2>&1 | tee "heal-rpc-$regression.log"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "heal-rpc-$regression.log"
+          done
       - name: Check production binary with locked dependencies
         shell: bash
         run: |
@@ -174,6 +211,7 @@ jobs:
             writer-setup-test.log
             duration-buckets-test.log
             backfill-diagnostic-test.log
+            heal-*.log
             binary-check.log
             resource-snapshot.txt
           if-no-files-found: ignore

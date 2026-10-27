@@ -6376,10 +6376,31 @@ mod tests {
             .expect("RPC target disk");
         let volume = "evidence-rpc";
         disk.make_volume(volume).await.expect("create evidence bucket");
-        let record = format!("object/{}/delete-prepared", Uuid::new_v4());
-        disk.write_all(volume, &record, Bytes::from_static(b"unresolved recovery record"))
-            .await
-            .expect("write evidence");
+        let transaction = Uuid::new_v4();
+        let record = format!("object/{transaction}/delete-prepared");
+        // Existence probes retain strict journal decoding; create real evidence
+        // through the same preparation path used by recoverable deletes.
+        crate::storage::storage_api::ecstore_disk::DiskAPI::delete_version_recoverable(
+            disk.as_ref(),
+            volume,
+            "object",
+            rustfs_filemeta::FileInfo {
+                name: "object".to_owned(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mark_deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            },
+            true,
+            crate::storage::storage_api::DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prepare valid delete recovery evidence");
+        let evidence = disk.read_all(volume, &record).await.expect("read prepared journal");
         for (object, expected) in [("object", true), ("other", false)] {
             let mut request = Request::new(RecoverDeleteTransactionRequest {
                 disk: configured.endpoint().to_string(),
@@ -6406,10 +6427,35 @@ mod tests {
                 DeleteRecoveryRpcReply::Evidence { present } if present == expected
             ));
         }
-        assert_eq!(
-            disk.read_all(volume, &record).await.expect("read retained evidence"),
-            b"unresolved recovery record"[..]
-        );
+        assert_eq!(disk.read_all(volume, &record).await.expect("read retained evidence"), evidence);
+
+        let corrupt = Bytes::from_static(b"{invalid recovery journal");
+        disk.write_all(volume, &record, corrupt.clone())
+            .await
+            .expect("corrupt owned evidence fixture");
+        let mut request = Request::new(RecoverDeleteTransactionRequest {
+            disk: configured.endpoint().to_string(),
+            volume: volume.to_owned(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&DeleteRecoveryRpcOperation::Exists {
+                object: "object".to_owned(),
+            })
+            .expect("encode corrupt evidence probe")
+            .into(),
+        });
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+            .expect("canonical corrupt evidence probe");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("corrupt evidence digest");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .recover_delete_transaction(request)
+            .await
+            .expect("corrupt evidence RPC response")
+            .into_inner();
+        assert!(!response.success, "corrupt evidence must fail closed, never report absence");
+        assert!(response.error.is_some(), "corrupt evidence must return an explicit error");
+        assert!(response.result.is_empty(), "an error must not include an Evidence(false) success payload");
+        assert_eq!(disk.read_all(volume, &record).await.expect("read retained corrupt evidence"), corrupt);
     }
 
     #[tokio::test]

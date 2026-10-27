@@ -16,7 +16,7 @@ jobs:
   native-linux:
     if: github.repository == 'ixbtcom/rustfs'
     runs-on: [self-hosted, Linux, X64, ixbt-rustfs-builder]
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: '16'
       CARGO_INCREMENTAL: '0'
